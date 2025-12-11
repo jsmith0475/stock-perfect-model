@@ -1,0 +1,50 @@
+# Stock Perfect Model - Dependencies
+# Install with: pip install -r requirements.txt
+
+# ====================
+# Core Data & Math
+# ====================
+numpy>=1.24.0
+pandas>=2.0.0
+scipy>=1.10.0
+
+# ====================
+# Financial Data
+# ====================
+yfinance>=0.2.28
+
+# ====================
+# Visualization
+# ====================
+matplotlib>=3.7.0
+
+# ====================
+# Algebraic Topology
+# ====================
+ripser>=0.6.4          # Persistent homology computation
+persim>=0.3.1          # Persistence diagram utilities
+
+# ====================
+# AWS Bedrock (LLM)
+# ====================
+boto3>=1.28.0          # AWS SDK
+botocore>=1.31.0       # AWS core library
+
+# ====================
+# News & Sentiment
+# ====================
+gnews>=0.3.7           # Google News fetching
+feedparser>=6.0.10     # RSS feed parsing
+
+# ====================
+# Environment
+# ====================
+python-dotenv>=1.0.0   # .env file loading
+
+# ====================
+# Optional: Development
+# ====================
+# pytest>=7.0.0        # Testing
+# black>=23.0.0        # Code formatting
+# mypy>=1.0.0          # Type checking
+
