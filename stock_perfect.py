@@ -59,6 +59,11 @@ class StockPerfectModel:
         self.adj_matrix: Optional[np.ndarray] = None
         self.residuals: Optional[np.ndarray] = None
         
+        # Spectral Components
+        self.eigenvalues: Optional[np.ndarray] = None
+        self.eigenvectors: Optional[np.ndarray] = None
+        self.spectral_features: dict = {}
+        
         # Topology features
         self.diagrams = None
         self.h1_total_persistence: float = 0.0
@@ -187,20 +192,23 @@ class StockPerfectModel:
         with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
             try:
                 # Use symmetric eigendecomposition for better stability
-                eigenvalues, eigenvectors = np.linalg.eigh(L_norm)
+                # Store as class attributes for Spectral Analysis
+                self.eigenvalues, self.eigenvectors = np.linalg.eigh(L_norm)
                 
                 # Clip eigenvalues to valid range [0, 2] for normalized Laplacian
-                eigenvalues = np.clip(eigenvalues, 0, 2)
+                self.eigenvalues = np.clip(self.eigenvalues, 0, 2)
                 
                 # Compute exp(-t * lambda) for each eigenvalue
-                exp_eigenvalues = np.exp(-t * eigenvalues)
+                exp_eigenvalues = np.exp(-t * self.eigenvalues)
                 
                 # Reconstruct heat kernel: H = U * diag(exp(-t*lambda)) * U^T
-                H = eigenvectors @ np.diag(exp_eigenvalues) @ eigenvectors.T
+                H = self.eigenvectors @ np.diag(exp_eigenvalues) @ self.eigenvectors.T
                 
             except np.linalg.LinAlgError:
                 print("  Warning: Eigendecomposition failed, using matrix exponential fallback")
                 H = expm(-t * L_norm)
+                # Cannot do spectral analysis if this fails
+                self.eigenvalues, self.eigenvectors = None, None
             
             # Ensure H is valid
             H = np.nan_to_num(H, nan=0.0, posinf=1.0, neginf=0.0)
@@ -265,52 +273,198 @@ class StockPerfectModel:
         
         df['signal'] = df['z_score'].apply(get_signal)
         df['abs_residual'] = np.abs(df['residual'])
+        
+        # Add Walsh Stability (Time-Series Quality)
+        # We compute this for every ticker
+        stability_metrics = self.compute_walsh_stability()
+        if stability_metrics:
+            df['walsh_score'] = df['ticker'].map(lambda t: stability_metrics.get(t, {}).get('score', 0))
+            df['walsh_class'] = df['ticker'].map(lambda t: stability_metrics.get(t, {}).get('class', 'Unknown'))
+        else:
+            df['walsh_score'] = 0.0
+            df['walsh_class'] = 'Unknown'
+            
         df = df.sort_values('abs_residual', ascending=False)
         
-        return df[['ticker', 'residual', 'z_score', 'signal', 'abs_residual']]
+        # Reorder columns
+        cols = ['ticker', 'residual', 'z_score', 'signal', 'walsh_score', 'walsh_class', 'abs_residual']
+        return df[cols]
+    
+    def compute_walsh_stability(self) -> dict:
+        """
+        Computes Walsh-like stability metrics (Sequency/Choppiness) for residuals.
+        
+        Analyzes the time-series of residuals to determine if they are:
+        - Elastic (High Choppiness/Mean Reverting) -> GOOD SIGNAL
+        - Drifting (Low Choppiness/Trending) -> RISKY SIGNAL
+        
+        Returns:
+            Dictionary mapping ticker -> {score, class}
+        """
+        if self.residuals is None:
+            return {}
+            
+        results = {}
+        tickers = self.returns.columns
+        n_days = self.residuals.shape[1]
+        
+        # Look at last 60 days or full history if shorter
+        lookback = min(60, n_days)
+        
+        for i, ticker in enumerate(tickers):
+            # Extract residual time series
+            r_series = self.residuals[i, -lookback:]
+            
+            # center
+            r_centered = r_series - np.mean(r_series)
+            
+            # Count Zero Crossings (Sequency Proxy)
+            # Signal: +1 if positive, -1 if negative
+            signs = np.sign(r_centered)
+            # Remove zeros
+            signs = signs[signs != 0]
+            
+            # Count flips
+            flips = np.sum(np.abs(np.diff(signs))) / 2
+            
+            # Max possible flips is length - 1
+            max_flips = len(signs) - 1 if len(signs) > 0 else 1
+            
+            # Sequency Score (0.0 to 1.0)
+            # 1.0 = Flips every day (Perfectly Elastic)
+            # 0.0 = Never flips (Perfect Trend/Drift)
+            sequency_score = flips / max_flips if max_flips > 0 else 0
+            
+            # Classify
+            if sequency_score > 0.3:
+                classification = "Elastic"
+            elif sequency_score > 0.15:
+                classification = "Mixed"
+            else:
+                classification = "Drifting"
+                
+            results[ticker] = {
+                'score': sequency_score,
+                'class': classification
+            }
+            
+        return results
     
     def get_trading_signals(self, min_z_score: float = 1.0) -> dict:
         """
-        Get actionable trading signals filtered by z-score threshold.
+        Get actionable trading signals filtered by Z-score and coupled with Regime Sizing.
         
         Args:
             min_z_score: Minimum absolute z-score for a signal (default 1.0)
             
         Returns:
-            Dictionary with 'buy' and 'sell' lists of tickers
+            Dictionary with 'buy' and 'sell' lists and sizing info
         """
         rankings = self.get_residual_rankings()
         
-        buys = rankings[rankings['z_score'] > min_z_score]['ticker'].tolist()
-        sells = rankings[rankings['z_score'] < -min_z_score]['ticker'].tolist()
+        # Get Regime Sizing
+        size_multiplier, reasons = self.get_position_size_multiplier()
+        
+        # If size is too small, filtering is stricter or we kill signals entirely
+        if size_multiplier < 0.1:
+            return {
+                'buy': [],
+                'sell': [],
+                'buy_count': 0,
+                'sell_count': 0,
+                'regime_size_multiplier': 0.0,
+                'regime_note': "NO TRADE: Regime too unstable"
+            }
+            
+        # Filter raw signals
+        raw_buys = rankings[rankings['z_score'] > min_z_score]
+        raw_sells = rankings[rankings['z_score'] < -min_z_score]
+        
+        # Helper to format signal
+        def format_signal(row):
+            # Base size from global regime
+            final_size = size_multiplier
+            note = ""
+            
+            # Stock-specific Walsh adjustment
+            w_class = row.get('walsh_class', 'N/A')
+            w_score = row.get('walsh_score', 0.0)
+            
+            if w_class == 'Drifting':
+                final_size = 0.0
+                note = " (Drifting - Avoid)"
+            elif w_class == 'Mixed':
+                final_size *= 0.5
+                note = " (Mixed Quality)"
+                
+            return {
+                'ticker': row['ticker'],
+                'z_score': round(row['z_score'], 2),
+                'residual': round(row['residual'], 4),
+                'walsh_class': w_class,
+                'walsh_score': w_score,
+                'recommended_size': f"{int(final_size * 100)}%{note}"
+            }
+            
+        buy_signals = [format_signal(row) for _, row in raw_buys.iterrows()]
+        sell_signals = [format_signal(row) for _, row in raw_sells.iterrows()]
         
         return {
-            'buy': buys,
-            'sell': sells,
-            'buy_count': len(buys),
-            'sell_count': len(sells),
+            'buy': buy_signals,
+            'sell': sell_signals,
+            'buy_count': len(buy_signals),
+            'sell_count': len(sell_signals),
+            'regime_size_multiplier': size_multiplier,
+            'regime_reasons': reasons
         }
     
-    def get_position_size_multiplier(self) -> float:
+    def get_position_size_multiplier(self) -> tuple[float, list[str]]:
         """
-        Get position size multiplier based on regime (Section 5.3).
+        Get position size multiplier based on Regime (Topology + Spectral).
         
         Returns:
-            Multiplier: 1.0 (stable), 0.5 (transitioning), 0.25 (fragmented)
+            Tuple of (Multiplier, List of reasons)
+            Multiplier: 0.0 to 1.0
         """
-        # Thresholds calibrated for typical H1 persistence values
-        # These should be tuned based on historical data
+        multiplier = 1.0
+        reasons = []
+        
+        # 1. Topology Check (H1 Loops)
+        # Thresholds calibrated for typical H1 persistence
         H1_LOW = 0.1    # Below this = stable
         H1_HIGH = 0.5   # Above this = fragmented
         
-        h1 = self.h1_total_persistence
+        if self.h1_total_persistence > H1_HIGH:
+            multiplier *= 0.25
+            reasons.append("High Topological Complexity (Fragmented Structure)")
+        elif self.h1_total_persistence > H1_LOW:
+            multiplier *= 0.5
+            reasons.append("Moderate Topological Complexity")
+            
+        # 2. Spectral Check (Coherence & Entropy)
+        if self.spectral_features:
+            coh = self.spectral_features.get('market_coherence', 0)
+            ent = self.spectral_features.get('normalized_entropy', 0)
+            
+            # High Coherence = Market is moving as one block
+            # Hard to pick distinct winners, increasing Z-threshold effectively
+            # But here we just reduce size for caution against false positives
+            if coh > 0.7: 
+                multiplier *= 0.75
+                reasons.append(f"High Market Coherence ({coh:.2f}) - Beta driving returns")
+                
+            # High Entropy = Chaotic energy distribution
+            if ent > 0.8:
+                multiplier *= 0.5
+                reasons.append(f"High Spectral Entropy ({ent:.2f}) - Disordered Market")
+                
+        # Cap min/max
+        multiplier = max(0.0, min(1.0, multiplier))
         
-        if h1 < H1_LOW:
-            return 1.0   # Stable regime: full size
-        elif h1 < H1_HIGH:
-            return 0.5   # Transitioning: half size
-        else:
-            return 0.25  # Fragmented: quarter size
+        if multiplier == 1.0:
+            reasons.append("Stable Market Regime")
+            
+        return multiplier, reasons
     
     def get_regime_status(self) -> dict:
         """
@@ -319,26 +473,112 @@ class StockPerfectModel:
         Returns:
             Dictionary with regime info and sizing
         """
-        multiplier = self.get_position_size_multiplier()
+        multiplier, reasons = self.get_position_size_multiplier()
         
-        if multiplier == 1.0:
+        if multiplier >= 0.8:
             regime = "STABLE"
-            description = "Low H1 persistence - simple market structure"
-        elif multiplier == 0.5:
+        elif multiplier >= 0.4:
             regime = "TRANSITIONING"
-            description = "Medium H1 persistence - market structure shifting"
         else:
-            regime = "FRAGMENTED"
-            description = "High H1 persistence - complex/unstable structure"
+            regime = "DEFENSIVE"
             
+        description = " | ".join(reasons)
+        
+        # Add spectral context if available
+        spectral_desc = ""
+        if self.spectral_features:
+            coh = self.spectral_features.get('market_coherence', 0)
+            ent = self.spectral_features.get('normalized_entropy', 0)
+            
+            if coh > 0.5:
+                spectral_desc = " | High Market Coherence"
+            elif ent > 0.8:
+                spectral_desc = " | High Entropy"
+        
+        # Add Walsh context (Market Elasticity) if available
+        walsh_desc = ""
+        walsh_data = self.compute_walsh_stability()
+        avg_elasticity = 0.0
+        if walsh_data:
+            scores = [d['score'] for d in walsh_data.values()]
+            avg_elasticity = sum(scores) / len(scores) if scores else 0
+            
+            if avg_elasticity > 0.4:
+                walsh_desc = " | High Elasticity (Mean Reverting)"
+            elif avg_elasticity < 0.2:
+                walsh_desc = " | Low Elasticity (Trending)"
+                
         return {
             'regime': regime,
-            'description': description,
+            'description': description + spectral_desc + walsh_desc,
             'h1_persistence': self.h1_total_persistence,
             'h1_features': self.h1_feature_count,
+            'spectral_features': self.spectral_features,
+            'market_elasticity': avg_elasticity,
             'position_multiplier': multiplier,
-            'recommended_sizing': f"{int(multiplier * 100)}% of normal"
+            'recommended_sizing': f"{int(multiplier * 100)}% of normal",
+            'sizing_reasons': reasons
         }
+            
+    def compute_spectral_features(self) -> dict:
+        """
+        Computes Graph Fourier Transform (GFT) features.
+        
+        Analyzes the power spectrum of the returns on the graph to measure:
+        - Market Coherence: How much energy is in the global market mode (lambda_0)
+        - Spectral Entropy: How complex/disordered the market signal is
+        
+        Returns:
+            Dictionary of spectral features
+        """
+        if self.eigenvectors is None:
+            print("  Warning: Eigenvectors not available. Skipping spectral analysis.")
+            return {}
+            
+        if self.returns is None:
+            raise ValueError("Returns not computed.")
+            
+        print("Computing Spectral Analysis (GFT)...")
+        
+        # 1. Graph Fourier Transform (GFT)
+        # Project signal (returns) onto eigenvectors (U^T * s)
+        # Using the most recent time step
+        recent_returns = self.returns.iloc[-1].values
+        gft_coefficients = self.eigenvectors.T @ recent_returns
+        
+        # 2. Power Spectrum (Energy)
+        power_spectrum = gft_coefficients ** 2
+        total_energy = np.sum(power_spectrum)
+        
+        # Normalize to get probability distribution for specific modes
+        p_spectrum = power_spectrum / total_energy
+        
+        # 3. Market Coherence (Energy in lowest frequency mode lambda_0)
+        # The first eigenvector (lambda ~ 0) usually represents the global market trend
+        market_coherence = p_spectrum[0]
+        
+        # 4. Spectral Entropy
+        # H(s) = -sum(p * log(p))
+        # Add epsilon for numerical stability
+        p_spectrum_safe = p_spectrum[p_spectrum > 0]
+        spectral_entropy = -np.sum(p_spectrum_safe * np.log(p_spectrum_safe))
+        
+        # Normalize entropy between 0 and 1 (divided by log(N))
+        n_modes = len(p_spectrum)
+        normalized_entropy = spectral_entropy / np.log(n_modes)
+        
+        self.spectral_features = {
+            'market_coherence': market_coherence,
+            'spectral_entropy': spectral_entropy,
+            'normalized_entropy': normalized_entropy,
+            'total_energy': total_energy
+        }
+        
+        print(f"Spectral Analysis Computed:")
+        print(f"  Market Coherence (Lambda_0 Energy): {market_coherence:.4f}")
+        print(f"  Normalized Spectral Entropy: {normalized_entropy:.4f}")
+        
+        return self.spectral_features
         
     # ==================== TOPOLOGY LAYER ====================
         
@@ -537,6 +777,7 @@ class StockPerfectModel:
         self.compute_returns()
         self.build_graph()
         self.compute_laplacian_residuals(t=diffusion_time)
+        self.compute_spectral_features()
         self.compute_topology()
         
         print("\n" + "="*60)
@@ -629,15 +870,33 @@ if __name__ == "__main__":
     print("\n" + "="*70)
     print("RESIDUAL RANKINGS (with z-scores and signals)")
     print("="*70)
+    print("Legend:")
+    print("  residual = How much stock deviates from graph-diffusion expectation")
+    print("  z_score  = Standard deviations from mean (>±1 = tradeable signal)")
+    print("  walsh_score = Sequency (sign-flip rate): >0.3=Elastic, <0.15=Drifting")
+    print("")
     print(model.get_residual_rankings().head(10).to_string(index=False))
     
     # Show trading signals
     print("\n" + "="*70)
-    print("TRADING SIGNALS")
+    print("TRADING SIGNALS (Regime Adjusted)")
     print("="*70)
     signals = model.get_trading_signals(min_z_score=1.0)
-    print(f"✅ BUY  (z > +1): {signals['buy']}")
-    print(f"⚠️  SELL (z < -1): {signals['sell']}")
+    
+    print(f"Regime Multiplier: {signals['regime_size_multiplier']:.2f}")
+    print(f"  → This is the GLOBAL position sizing based on market topology/spectral risk")
+    if isinstance(signals.get('regime_reasons'), list):
+         print(f"  → Factors: {', '.join(signals['regime_reasons'])}")
+    
+    print(f"\n✅ BUY  (Count: {signals['buy_count']})")
+    print(f"   Format: [Ticker] (Z-score) | Walsh Class (Score) | Final Size")
+    print(f"   Legend: Z-score = How unusual (>1 = tradeable) | Walsh = Mean-reversion quality (>0.3 = Elastic)")
+    for s in signals['buy']:
+        print(f"   - {s['ticker']:<5} (z={s['z_score']:>4.1f}) | Walsh: {s['walsh_class']:<8} ({s['walsh_score']:.2f}) | Size: {s['recommended_size']}")
+        
+    print(f"\n⚠️  SELL (Count: {signals['sell_count']})")
+    for s in signals['sell']:
+        print(f"   - {s['ticker']:<5} (z={s['z_score']:>4.1f}) | Walsh: {s['walsh_class']:<8} ({s['walsh_score']:.2f}) | Size: {s['recommended_size']}")
     
     # Show regime status
     print("\n" + "="*70)
@@ -646,9 +905,28 @@ if __name__ == "__main__":
     regime = model.get_regime_status()
     print(f"Regime:              {regime['regime']}")
     print(f"Description:         {regime['description']}")
-    print(f"H1 Persistence:      {regime['h1_persistence']:.4f}")
-    print(f"H1 Features:         {regime['h1_features']}")
+    print(f"H1 Persistence:      {regime['h1_persistence']:.4f}  (Low < 0.1 = Stable | High > 0.5 = Fragmented)")
+    
+    if regime.get('spectral_features'):
+        sf = regime['spectral_features']
+        print(f"Market Coherence:    {sf['market_coherence']:.4f}  (High > 0.7 = Beta-driven | Low < 0.3 = Stock-picking)")
+        print(f"Spectral Entropy:    {sf['normalized_entropy']:.4f}  (High > 0.8 = Chaotic | Low < 0.5 = Orderly)")
+        
+    print(f"Avg Elasticity:      {regime.get('market_elasticity', 0):.4f}  (High > 0.4 = Mean-reverting market)")
     print(f"Position Sizing:     {regime['recommended_sizing']}")
+    
+    print("\n" + "="*70)
+    print("INTERPRETATION GUIDE")
+    print("="*70)
+    print("Size = Regime Multiplier × Walsh Multiplier")
+    print("  - 100% = Perfect conditions (Stable regime + Elastic stock)")
+    print("  - 50%  = Moderate risk (Transitioning regime OR Mixed elasticity)")
+    print("  - 0%   = DO NOT TRADE (Fragmented regime OR Drifting stock)")
+    print("\nWalsh Score (Sequency):")
+    print("  - >0.5  = Highly Elastic (stock bounces aggressively around mean)")
+    print("  - 0.3-0.5 = Elastic (good mean-reversion behavior)")
+    print("  - 0.15-0.3 = Mixed (indeterminate structure)")
+    print("  - <0.15 = Drifting (trending away - AVOID falling knife)")
     
     # Option 2: Run full pipeline with LLM (requires AWS Bedrock credentials)
     # Uncomment to enable:
